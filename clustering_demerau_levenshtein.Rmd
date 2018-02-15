@@ -1,0 +1,297 @@
+---
+title: "Demerau-Levenshtein Distance Clustering"
+author: "Tara Eicher, Andy Patt, Juan Barajas, Piyali Das"
+date: "12 January 2017"
+autosize: true
+output: 
+  html_document:
+    toc: true
+    theme: yeti
+    highlight: kate
+---
+If using public data, download the sequences in FASTQ format from the link and save them in a folder. You will need to tweak the URL's accordingly. For example, this code downloads http://www.ebi.ac.uk/ena/data/view/LT59&display=fasta&download=fasta&filename=LT596685.fastq through http://www.ebi.ac.uk/ena/data/view/LT59&display=fasta&download=fasta&filename=LT598170.fastq. If you don't have many sequences to download, you can also do it manually and skip this part.
+```{r}
+BaseUrl="http://www.ebi.ac.uk/ena/data/view/LT59"
+ending=".fasta"
+middle="&display=fasta&download=fasta&filename=LT59"
+directory="fastqs/"
+if(length(list.files("fastqs/", all.files = TRUE, include.dirs = TRUE, no.. = TRUE)) == 0){
+  for (i in 6685:8170){
+    download.file(url = paste0(BaseUrl, i, middle, i, ending), destfile = paste0(directory, i, ".fastq"))
+  }
+}
+```
+
+Format the data as a dataframe and save it as a .Rda file.
+```{r}
+if (!require(SummarizedExperiment)){
+  source("https://bioconductor.org/biocLite.R")
+  biocLite("SummarizedExperiment")
+  library("SummarizedExperiment")
+}
+if (!require(ShortRead)){
+  source("https://bioconductor.org/biocLite.R")
+  biocLite("ShortRead")
+  library("ShortRead")
+}
+if(!file.exists("data.Rda")){
+  fastas<-readFasta(dirPath = "fastqs/")
+  sequences<-sread(fastas)
+  hist(width(sequences),breaks = 30)
+  length(fastas)
+  ids<-as.character(ShortRead::id(fastas))
+
+  #Get unique loci
+  loci<-gsub(" ",",",ids)
+  loci<-sapply(loci, function(x) strsplit(x, ",")[[1]][which(strsplit(x, ",")[[1]]=="gene")-1])
+  nuclear_pos = which(lapply(loci,length)>0)
+  loci = loci[nuclear_pos]
+  colnames <- unlist(lapply(unique(loci), function(x){ 
+    c(paste0(x,"_a1"), 
+    paste0(x,"_a2"))
+    }))
+  
+  #Get unique isolates
+  isolates<-gsub(" ",",",ids)
+  isolates<-sapply(isolates, function(x) strsplit(x, ",")[[1]][which(strsplit(x, ",")[[1]]=="isolate")+1])
+  isolates = isolates[nuclear_pos]
+  rownames<-unique(isolates)
+  
+  #Get species
+  species<-gsub(" ",",", ids)
+  species<-gsub("partial,","", species)
+  species<-
+    sapply(species, function(x) strsplit(x, ",")[[1]][(which(strsplit(x, ",")[[1]]=="gene")-2)])
+  species = species[nuclear_pos]
+
+  
+  iso_sub_key<-unique(cbind(isolates,species))
+  iso_sub_key<-iso_sub_key[which(iso_sub_key[,2]!="partial"),]
+  rownames(iso_sub_key)=c(1:nrow(iso_sub_key))
+  
+  data<-data.frame(matrix(nrow = length(rownames),ncol = length(colnames)))
+  
+  rownames(data) = rownames 
+  colnames(data) = colnames
+  
+  data$species = rep("temp", nrow(data))
+  for(i in 1:nrow(data)){
+    data$species[i]<-iso_sub_key[which(iso_sub_key[,1]==as.character(rownames[i])),2][1]
+  }
+  
+  #Make sure each file goes into its appropriate location.
+  for(i in 1:length(loci)){
+    if(i%%2==1){
+      loci[i]=paste0(loci[i],"_a1")
+    } else {
+      loci[i]=paste0(loci[i],"_a2")
+    }
+  }
+  sequences = sequences[nuclear_pos]
+  iso_sub_fasta_gene_key<-cbind(isolates, species, loci, 
+                           sapply(sequences, function(x) as.character(x)))
+  rownames(iso_sub_fasta_gene_key) <- c(1:nrow(iso_sub_fasta_gene_key))
+  colnames(iso_sub_fasta_gene_key) <- c("Isolate","species","Gene","Sequence")
+  
+  for(i in 1:nrow(iso_sub_fasta_gene_key)){
+    col<-iso_sub_fasta_gene_key[i,3]
+    row<-iso_sub_fasta_gene_key[i,1]
+    colInd = which(colnames(data) == col)
+    rowInd = which(rownames(data) == row)
+    data[rowInd,colInd]<-iso_sub_fasta_gene_key[i,4]
+    data$species <- vapply(data$species, paste, collapse = ", ", character(1L))
+  } 
+  
+  #Create the data table.
+  write.table(data, file = "data.Rda", col.names = TRUE, row.names = TRUE, sep = ",")
+}
+```
+
+The next step is to load the data, which is formatted as a data frame. It contains a row for each sample, a column for the species, and a column for each allele of each of the loci.
+```{r}
+data = read.csv("data.Rda")
+```
+
+Set up color vector for figures.
+```{r}
+key<-sort(unique(data$species))
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+mypalette<-gg_color_hue(length(unique(data$species)))
+mycolors<-c()
+for(i in 1:length(data$species)){
+  key.match<-match(data$species[i],key)
+  mycolors<-c(mycolors,mypalette[[key.match]])
+}
+
+```
+
+Next, consider compute a dissimilarity matrix for the samples based on the sequences at each intron. Use Demerau-Levenshtein distance. This measures the minimum number of insertions, deletions, transpositions, and substitutions to transform one string into another.Calculate a distance matrix for each locus and then sum the distances for each locus to get the final distance metric.
+```{r}
+  if (!require(stringdist)){
+  install.packages("stringdist")
+  library(stringdist)
+  }
+
+remove_list = c()
+for(i in 1:(length(colnames(data)) - 1)){
+  if(length(which(is.na(data[,i]))) / length(data[,i]) > 0.8){
+    remove_list = c(remove_list, i)
+  }
+}
+if(!is.null(remove_list)){
+  data = data[,-as.numeric(remove_list)]
+}
+
+remove_list2 = c()
+for(i in 1:(length(rownames(data)) - 1)){
+  if(length(which(is.na(data[i,]))) / length(data[i,]) > 0.5){
+    remove_list2 = c(remove_list2, i)
+  }
+}
+if(!is.null(remove_list)){
+  data = data[-as.numeric(remove_list2),]
+}
+```
+
+First, calculate the distance metric for those with no missing values.
+Then, find what is closest to each missing datum and impute the values.
+```{r}
+  x = 1:length(unique(colnames(data)))
+  matrices = lapply(x, function(x) matrix(0, nrow = length(unique(rownames(data))), ncol =  length(unique(rownames(data)))))
+  for(i in 1:length(matrices)){
+    i;
+    matrices[[i]] = as.matrix(stringdistmatrix(data[,i], method = "dl"))
+  }
+```
+
+Replace missing values. For each missing locus, replace it with the locus value of the closest species that is not missing that locus. Measure closeness by the total distance over non-missing loci divided by the total length of those loci.
+```{R}
+data_new = data
+#For each species
+for(j in 1:dim(data)[1]){
+  is_na = which(is.na(data[j,]))
+  #For each missing locus in that species
+  for(k in is_na){
+    #Find a list of species not missing that locus.
+    comparison_species = which(!is.na(data[, k]))
+    total_diffs = rep(0, length(comparison_species))
+    total_lengths = rep(0, length(comparison_species))
+    #For each of those species, find the total distance from the species in question.
+    for(l in 1:dim(data)[2]){
+      which_not_na = which(!is.na(matrices[[l]][j, comparison_species]))
+      total_diffs[which_not_na] =  matrices[[l]][j, comparison_species[which_not_na]] + total_diffs[which_not_na]
+      total_lengths[which_not_na] = pmax(rep(nchar(as.character(data[j, l])), length(comparison_species[which_not_na])), nchar(as.character(data[comparison_species[which_not_na], l]))) + total_lengths[which_not_na]
+    }
+    #Replace the locus with that of the closest species.
+    ratios = as.numeric(total_diffs / total_lengths)
+    not_nan = which(!is.nan(ratios))
+    min_index = comparison_species[which.min(ratios[not_nan])]
+    data_new[j, k] = data[min_index, k]
+  }
+}
+data = data_new
+```
+
+Calculate final distance matrix.
+```{r}
+mat  = matrix(0, nrow = length(unique(rownames(data))), ncol = length(unique(rownames(data))))
+for(i in 1:length(unique(colnames(data)))){
+    mat = as.matrix(stringdistmatrix(data[,i], method = "dl")) + mat
+}
+```
+
+PCA for first two principal components.
+```{r}
+if (!require(ggplot2)){
+  install.packages("ggplot2")
+  library(ggplot2)
+}
+if (!require(plotly)){
+  install.packages("plotly")
+  library(plotly)
+}
+mytitle=paste0("Demerau-Levenshtein distance")
+mypca=prcomp(mat,center=T,scale=T)
+percvar=round((mypca$sdev)^2 / sum(mypca$sdev^2)*100,2)
+mydf=data.frame(PC1=mypca$x[,"PC1"],PC2=mypca$x[,"PC2"],
+                    species=data[1,],Isolate=rownames(data))
+    
+    #Try to implement point shape by geographical region of extraction
+    p<-ggplot(mydf,aes(PC1,PC2,color=data$species)) +
+      geom_point(aes(PC1,PC2),size=4) +
+      xlab(paste0("PC1: ",percvar[1],"% variance")) +
+      ylab(paste0("PC2: ",percvar[2],"% variance")) +
+      ggtitle(mytitle) +
+      theme(axis.line = element_line(colour = "black"),
+            axis.title=element_text(size=12,face="bold"),
+            plot.title=element_text(size=14,face="bold")
+      )
+    ggplotly(p + theme_bw())%>%
+    layout(autosize=TRUE)
+```
+
+Hierarchical clustering
+```{r}
+if(!require(gplots)){
+  install.packages("gplots")
+  library(gplots)
+}
+if(!require(RColorBrewer)){
+  install.packages("RColorBrewer")
+  library(RColorBrewer)
+}
+mycols=c(colorRampPalette(brewer.pal(5,"YlOrRd")) (200)[200:1],colorRampPalette(brewer.pal(5,"Greys"))(55))
+par(mar = par()$mar + c(10,15,5,7))
+heatmap.2(x=mat,col=mycols, notecol="black",trace = "none", tracecol = "black", dendrogram = "col",
+              density.info = "none",key = TRUE, key.title = "TEST",
+              key.xlab = "Dissimilarity",key.ylab = NULL, keysize = .1, lhei=c(1.5,3.2,1), lwid=c(1.5, 5),
+              ColSideColors = mycolors, labRow = FALSE, labCol = FALSE, margins = c(1,15))
+legend(1, 1.1,legend = unique(data$species),fill=unique(mycolors),cex=1, xpd = T)
+```
+
+Multidimensional Scaling
+```{r}
+unsup.mds <- cmdscale(mat)
+mydf <- data.frame(Dim_1=unsup.mds[,1],Dim_2=unsup.mds[,2],
+                       species=data$species,Isolate=rownames(data))
+    
+mytitle="MDS RF Proximity Based on Demerau-Levenshtein Distance Matrix"
+p=ggplot(data.frame(mydf),aes(Dim_1,Dim_2,color=species)) +
+      geom_point(aes(Dim_1,Dim_2),size=4) +
+      ggtitle(mytitle) +
+      theme(axis.line = element_line(colour = "black"))
+    ggplotly(p + theme_bw() + labs(x = "Dimension 1", y = "Dimension 2"))
+```
+
+Partitioning Around Medoids with k = 2, k = 3, and k = 4
+```{r}
+if (!require(cluster)) {
+  install.packages("cluster")
+  library(cluster)
+}
+
+pam_2 = pam(as.dist(mat), 2, diss = TRUE)
+plot(pam_2)
+
+pam_3 = pam(as.dist(mat), 3, diss = TRUE)
+plot(pam_3)
+
+pam_4 = pam(as.dist(mat), 4, diss = TRUE)
+plot(pam_4)
+par(mar = par()$mar + c(0,0,1,7))
+clusplot(pam_2, col.p = mycolors, col.clus="black",cex=2)
+
+library(gplots)
+library(RColorBrewer)
+mycols=c(colorRampPalette( brewer.pal(5,"YlOrRd")) (200)[200:1],colorRampPalette(brewer.pal(5,"Greys"))(55))
+legend(150, 60,legend = unique(data$species),fill=unique(mycolors),cex=1, xpd = TRUE)
+
+clusplot(pam_3, col.p = mycolors, col.clus="black",cex=2, cex.axis = 1.2, cex.lab = 1.2, main = "", sub="")
+legend(200, 70,legend = unique(data$species),fill=unique(mycolors),cex=1.2, xpd = TRUE, bty = "n")
+
+clusplot(pam_4, col.p = mycolors, col.clus="black",cex=2)
+legend(150, 60,legend = unique(data$species),fill=unique(mycolors),cex=1.2, xpd = TRUE)
+```
